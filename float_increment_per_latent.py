@@ -29,6 +29,13 @@ class AggregateBypassForwardHook:
             for adapter in adapters
         ]
         self.can_fuse_lora = False
+        self.fused_down = None
+        self.fused_up = None
+        self.fused_ranks = None
+        self.fused_alpha_scales = None
+        self.fused_is_conv = False
+        self.fused_conv_dim = 0
+        self.fused_kw_dict = {}
 
     def _forward(self, x, *args, **kwargs):
         out = self.original_forward(x, *args, **kwargs)
@@ -58,49 +65,62 @@ class AggregateBypassForwardHook:
         return PerSampleLoraLoader._expand_to_actual_batch(weights, actual_batch)
 
     def _fused_lora_delta(self, x, out):
-        is_conv = getattr(self.adapters[0], "is_conv", False)
-        conv_dim = getattr(self.adapters[0], "conv_dim", 0)
-        kw_dict = getattr(self.adapters[0], "kw_dict", {})
+        rank_scales = []
+
+        for adapter, rank, alpha_scale in zip(self.adapters, self.fused_ranks, self.fused_alpha_scales):
+            sample_scale = self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype) * alpha_scale
+            rank_scales.append(sample_scale[:, None].expand(-1, rank))
+
+        if self.fused_is_conv:
+            conv_fn = (F.conv1d, F.conv2d, F.conv3d)[self.fused_conv_dim - 1]
+            hidden = conv_fn(x, self.fused_down.to(dtype=x.dtype), **self.fused_kw_dict)
+            scale = torch.cat(rank_scales, dim=1).view(x.shape[0], -1, *([1] * self.fused_conv_dim))
+            hidden = hidden * scale
+            return conv_fn(hidden, self.fused_up.to(dtype=x.dtype))
+
+        hidden = F.linear(x, self.fused_down.to(dtype=x.dtype))
+        scale_shape = [x.shape[0]] + [1] * (hidden.ndim - 2) + [-1]
+        hidden = hidden * torch.cat(rank_scales, dim=1).view(*scale_shape)
+        return F.linear(hidden, self.fused_up.to(dtype=x.dtype))
+
+    def _prepare_fused_lora(self, dtype):
+        self.fused_is_conv = getattr(self.adapters[0], "is_conv", False)
+        self.fused_conv_dim = getattr(self.adapters[0], "conv_dim", 0)
+        self.fused_kw_dict = getattr(self.adapters[0], "kw_dict", {})
 
         down_weights = []
         up_weights = []
-        rank_scales = []
+        ranks = []
+        alpha_scales = []
 
         for adapter in self.adapters:
             up, down, alpha, _mid, _dora_scale, _reshape = adapter.weights
-            up = up.to(device=x.device, dtype=x.dtype)
-            down = down.to(device=x.device, dtype=x.dtype)
+            if dtype is not None:
+                up = up.to(dtype=dtype)
+                down = down.to(dtype=dtype)
 
             rank = int(down.shape[0])
-            alpha_scale = (float(alpha) / rank) if alpha is not None else 1.0
-            sample_scale = self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype) * alpha_scale
-            rank_scales.append(sample_scale[:, None].repeat(1, rank))
+            ranks.append(rank)
+            alpha_scales.append((float(alpha) / rank) if alpha is not None else 1.0)
 
-            if is_conv:
-                kernel_size = getattr(adapter, "kernel_size", (1,) * conv_dim)
+            if self.fused_is_conv:
+                kernel_size = getattr(adapter, "kernel_size", (1,) * self.fused_conv_dim)
                 in_channels = getattr(adapter, "in_channels", None)
                 if down.dim() == 2:
                     if in_channels is not None:
                         down = down.view(down.shape[0], in_channels, *kernel_size)
                     else:
-                        down = down.view(*down.shape, *([1] * conv_dim))
+                        down = down.view(*down.shape, *([1] * self.fused_conv_dim))
                 if up.dim() == 2:
-                    up = up.view(*up.shape, *([1] * conv_dim))
+                    up = up.view(*up.shape, *([1] * self.fused_conv_dim))
 
             down_weights.append(down)
             up_weights.append(up)
 
-        if is_conv:
-            conv_fn = (F.conv1d, F.conv2d, F.conv3d)[conv_dim - 1]
-            hidden = conv_fn(x, torch.cat(down_weights, dim=0), **kw_dict)
-            scale = torch.cat(rank_scales, dim=1).view(x.shape[0], -1, *([1] * conv_dim))
-            hidden = hidden * scale
-            return conv_fn(hidden, torch.cat(up_weights, dim=1))
-
-        hidden = F.linear(x, torch.cat(down_weights, dim=0))
-        scale_shape = [x.shape[0]] + [1] * (hidden.ndim - 2) + [-1]
-        hidden = hidden * torch.cat(rank_scales, dim=1).view(*scale_shape)
-        return F.linear(hidden, torch.cat(up_weights, dim=1))
+        self.fused_down = torch.cat(down_weights, dim=0).contiguous()
+        self.fused_up = torch.cat(up_weights, dim=1).contiguous()
+        self.fused_ranks = ranks
+        self.fused_alpha_scales = alpha_scales
 
     def _can_fuse_lora(self):
         if not self.adapters or not all(isinstance(adapter, LoRAAdapter) for adapter in self.adapters):
@@ -135,6 +155,8 @@ class AggregateBypassForwardHook:
             setup_hook._move_adapter_weights_to_device(device, dtype)
 
         self.can_fuse_lora = self._can_fuse_lora()
+        if self.can_fuse_lora:
+            self._prepare_fused_lora(dtype)
         self.original_forward = self.module.forward
         self.module.forward = self._forward
 
@@ -143,6 +165,10 @@ class AggregateBypassForwardHook:
             return
         self.module.forward = self.original_forward
         self.original_forward = None
+        self.fused_down = None
+        self.fused_up = None
+        self.fused_ranks = None
+        self.fused_alpha_scales = None
 
 
 class FloatIncrementPerLatent:
