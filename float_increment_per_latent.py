@@ -109,7 +109,6 @@ class PerSampleLoraLoader:
                 "step": ("FLOAT", {"default": 0.1, "min": 0.000001, "max": 100.0, "step": 0.01}),
                 "direction": (["increment", "decrement"], {"default": "increment"}),
                 "manual_values": ("STRING", {"default": "0.1,0.2,0.3,0.4", "multiline": True}),
-                "batch_size": ("INT", {"default": 10, "min": 1, "max": 8192, "step": 1}),
             }
         }
 
@@ -146,35 +145,65 @@ class PerSampleLoraLoader:
         return values
 
     @staticmethod
-    def _build_range_step_by_batch(start: float, stop: float, batch_size: int) -> List[float]:
-        if batch_size <= 0:
-            raise ValueError("batch_size must be > 0")
-        if batch_size == 1:
-            return [start]
-        auto_step = (stop - start) / float(batch_size - 1)
-        return [start + (auto_step * i) for i in range(batch_size)]
+    def _build_range_step_by_batch_tensor(start: float, stop: float, batch_size: int, device, dtype):
+        if batch_size <= 1:
+            return torch.tensor([start], device=device, dtype=dtype)
+        return torch.linspace(start, stop, steps=batch_size, device=device, dtype=dtype)
 
     @staticmethod
-    def _attach_per_sample_multiplier(adapter, per_sample_weights: List[float]):
+    def _install_runtime_batch_tracker(model, runtime_state):
+        previous_wrapper = model.model_options.get("model_function_wrapper")
+
+        def wrapper(model_apply, args):
+            cond_chunks = len(args.get("cond_or_uncond", [])) or 1
+            runtime_state["batch_size"] = max(1, int(args["input"].shape[0]) // cond_chunks)
+            if previous_wrapper is not None:
+                return previous_wrapper(model_apply, args)
+            return model_apply(args["input"], args["timestep"], **args["c"])
+
+        model.set_model_unet_function_wrapper(wrapper)
+
+    @staticmethod
+    def _expand_to_actual_batch(weights: torch.Tensor, actual_batch: int) -> torch.Tensor:
+        logical_batch = int(weights.shape[0])
+        if logical_batch == actual_batch:
+            return weights
+        if logical_batch > 0 and actual_batch > logical_batch:
+            repeats = (actual_batch + logical_batch - 1) // logical_batch
+            return weights.repeat(repeats)[:actual_batch]
+        return weights[:actual_batch]
+
+    @staticmethod
+    def _attach_per_sample_multiplier(
+        adapter,
+        per_sample_weights: List[float] | None,
+        runtime_state,
+        dynamic_range: tuple[float, float] | None,
+        base_strength: float,
+    ):
         if not hasattr(adapter, "h"):
             return
         original_h = adapter.h
-        weights_cpu = torch.tensor(per_sample_weights, dtype=torch.float32)
+        weights_cpu = None
+        if per_sample_weights is not None:
+            weights_cpu = torch.tensor(per_sample_weights, dtype=torch.float32)
 
         def patched_h(x, base_out):
-            batch = x.shape[0]
-            w = weights_cpu.to(device=x.device, dtype=base_out.dtype)
-            n = w.shape[0]
-            if batch == n:
-                w_batch = w
-            elif n > 0 and batch > n:
-                repeats = (batch + n - 1) // n
-                w_batch = w.repeat(repeats)[:batch]
+            actual_batch = int(x.shape[0])
+            if dynamic_range is not None:
+                logical_batch = int(runtime_state.get("batch_size", actual_batch))
+                start, stop = dynamic_range
+                weights = PerSampleLoraLoader._build_range_step_by_batch_tensor(
+                    start, stop, logical_batch, x.device, base_out.dtype
+                )
+                deltas = weights - base_strength
+                w_batch = PerSampleLoraLoader._expand_to_actual_batch(deltas, actual_batch)
             else:
-                w_batch = w[:batch]
+                w = weights_cpu.to(device=x.device, dtype=base_out.dtype)
+                w_batch = PerSampleLoraLoader._expand_to_actual_batch(w, actual_batch)
 
             old_multiplier = getattr(adapter, "multiplier", 1.0)
-            view_shape = [batch] + [1] * (base_out.ndim - 1)
+            view_shape = [actual_batch] + [1] * (base_out.ndim - 1)
             adapter.multiplier = w_batch.view(*view_shape)
             try:
                 return original_h(x, base_out)
@@ -193,19 +222,24 @@ class PerSampleLoraLoader:
         step,
         direction,
         manual_values,
-        batch_size,
     ):
         if mode == "manual_values":
             values = self._parse_manual_values(manual_values)
         elif mode == "range_step_by_batch":
-            values = self._build_range_step_by_batch(start, stop, batch_size)
+            values = None
         else:
             values = self._build_range(start, stop, step, direction)
-        if len(values) == 0:
+        if values is not None and len(values) == 0:
             raise ValueError("No weights were generated.")
-        weights = values
-        base_strength = float(min(weights))
-        delta_weights = [float(w - base_strength) for w in weights]
+        dynamic_range = None
+        if mode == "range_step_by_batch":
+            base_strength = float(min(start, stop))
+            delta_weights = None
+            dynamic_range = (float(start), float(stop))
+        else:
+            weights = values
+            base_strength = float(min(weights))
+            delta_weights = [float(w - base_strength) for w in weights]
 
         lora_path = folder_paths.get_full_path_or_raise("loras", lora_name)
         lora_file = comfy.utils.load_torch_file(lora_path, safe_load=True)
@@ -224,8 +258,12 @@ class PerSampleLoraLoader:
                 regular_patches[key] = patch_data
 
         new_model = model.clone()
+        runtime_state = {}
+        if dynamic_range is not None:
+            self._install_runtime_batch_tracker(new_model, runtime_state)
+
         # Baseline identical to normal LoRA application (model-only):
-        # apply full LoRA first using strength = first requested weight.
+        # apply full LoRA first using strength = lowest requested weight.
         # Then bypass adds per-sample deltas on top of this baseline.
         new_model.add_patches(loaded, base_strength)
 
@@ -235,7 +273,13 @@ class PerSampleLoraLoader:
             model_sd_keys = set(new_model.model.state_dict().keys())
             for key, adapter in bypass_patches.items():
                 if key in model_sd_keys:
-                    self._attach_per_sample_multiplier(adapter, delta_weights)
+                    self._attach_per_sample_multiplier(
+                        adapter,
+                        delta_weights,
+                        runtime_state,
+                        dynamic_range,
+                        base_strength,
+                    )
                     model_manager.add_adapter(key, adapter, strength=1.0)
                     matched_bypass += 1
             model_injections = model_manager.create_injections(new_model.model)
@@ -248,13 +292,20 @@ class PerSampleLoraLoader:
                 "This LoRA/model pair is not compatible with this per-sample bypass method."
             )
 
-        used_weights = ", ".join([f"{v:.6g}" for v in weights])
-        used_deltas = ", ".join([f"{v:.6g}" for v in delta_weights])
-        used = (
-            f"weights=[{used_weights}] deltas=[{used_deltas}] base={base_strength:.6g} "
-            f"loaded_total={len(loaded)} bypass={len(bypass_patches)} regular={len(regular_patches)} "
-            f"matched_bypass={matched_bypass}"
-        )
+        if dynamic_range is not None:
+            used = (
+                f"weights=runtime_linspace(start={start:.6g}, stop={stop:.6g}, batch=EmptySD3LatentImage) "
+                f"base={base_strength:.6g} loaded_total={len(loaded)} bypass={len(bypass_patches)} "
+                f"regular={len(regular_patches)} matched_bypass={matched_bypass}"
+            )
+        else:
+            used_weights = ", ".join([f"{v:.6g}" for v in weights])
+            used_deltas = ", ".join([f"{v:.6g}" for v in delta_weights])
+            used = (
+                f"weights=[{used_weights}] deltas=[{used_deltas}] base={base_strength:.6g} "
+                f"loaded_total={len(loaded)} bypass={len(bypass_patches)} regular={len(regular_patches)} "
+                f"matched_bypass={matched_bypass}"
+            )
         return (new_model, used)
 
 

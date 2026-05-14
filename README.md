@@ -11,11 +11,11 @@ Inputs:
 - `step` (used only in `range`)
 - `direction` (used only in `range`)
 - `manual_values` (used only in `manual_values`)
-- `batch_size` (used only in `range_step_by_batch`)
 
 `range_step_by_batch` formula:
-- if `batch_size = 1`: value = `start`
-- else: `auto_step = (stop - start) / (batch_size - 1)`
+- uses the runtime latent batch from `EmptySD3LatentImage`
+- if runtime batch is 1: value = `start`
+- else: `auto_step = (stop - start) / (runtime_batch - 1)`
 
 Examples:
 - start=-4, stop=5, batch_size=10 -> step=1
@@ -28,4 +28,4 @@ Outputs:
 ## Wiring
 1. `CheckpointLoaderSimple.model` -> `Per Sample LoRA Loader (Single Pass).model`
 2. Output `model` from this node -> `KSampler.model`
-3. Keep `EmptySD3LatentImage.batch_size` aligned with this node's `batch_size` when using `range_step_by_batch`.
+3. Set `EmptySD3LatentImage.batch_size` normally; `range_step_by_batch` reads the runtime batch during sampling.
