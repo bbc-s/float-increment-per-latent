@@ -25,6 +25,8 @@ Outputs:
 - `model` (patched)
 - `weights_used` (string preview)
 
+Multiple `Per Sample LoRA Loader (Single Pass)` nodes can be stacked. Each node keeps its own LoRA bypass hooks, so different LoRAs and ranges can be applied in sequence.
+
 ## Wiring
 1. `CheckpointLoaderSimple.model` -> `Per Sample LoRA Loader (Single Pass).model`
 2. Output `model` from this node -> `KSampler.model`

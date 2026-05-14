@@ -164,6 +164,15 @@ class PerSampleLoraLoader:
         model.set_model_unet_function_wrapper(wrapper)
 
     @staticmethod
+    def _next_injection_key(model) -> str:
+        index = len(model.injections)
+        while True:
+            key = f"per_sample_lora_{index}"
+            if key not in model.injections:
+                return key
+            index += 1
+
+    @staticmethod
     def _expand_to_actual_batch(weights: torch.Tensor, actual_batch: int) -> torch.Tensor:
         logical_batch = int(weights.shape[0])
         if logical_batch == actual_batch:
@@ -284,7 +293,7 @@ class PerSampleLoraLoader:
                     matched_bypass += 1
             model_injections = model_manager.create_injections(new_model.model)
             if model_manager.get_hook_count() > 0:
-                new_model.set_injections("per_sample_lora", model_injections)
+                new_model.set_injections(self._next_injection_key(new_model), model_injections)
 
         if matched_bypass == 0:
             raise ValueError(
