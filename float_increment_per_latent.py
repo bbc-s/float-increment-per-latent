@@ -11,7 +11,6 @@ import comfy.sd
 import comfy.utils
 import comfy.weight_adapter
 from comfy.patcher_extension import PatcherInjection
-from comfy.weight_adapter.lora import LoRAAdapter
 import folder_paths
 
 
@@ -125,8 +124,15 @@ class AggregateBypassForwardHook:
     def _can_fuse_lora(self):
         return self._fuse_blocker_reason() is None
 
+    @staticmethod
+    def _is_lora_like(adapter):
+        if type(adapter).__name__ != "LoRAAdapter":
+            return False
+        weights = getattr(adapter, "weights", None)
+        return isinstance(weights, tuple) and len(weights) == 6
+
     def _fuse_blocker_reason(self):
-        if not self.adapters or not all(isinstance(adapter, LoRAAdapter) for adapter in self.adapters):
+        if not self.adapters or not all(self._is_lora_like(adapter) for adapter in self.adapters):
             return "non_lora_adapter"
         is_conv = getattr(self.adapters[0], "is_conv", False)
         conv_dim = getattr(self.adapters[0], "conv_dim", 0)
