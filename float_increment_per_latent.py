@@ -5,10 +5,56 @@ import torch
 
 import comfy.lora
 import comfy.lora_convert
+import comfy.model_management
 import comfy.sd
 import comfy.utils
 import comfy.weight_adapter
+from comfy.patcher_extension import PatcherInjection
 import folder_paths
+
+
+AGGREGATE_INJECTION_KEY = "per_sample_lora_aggregate"
+AGGREGATE_ENTRIES_KEY = "_per_sample_lora_entries"
+
+
+class AggregateBypassForwardHook:
+    def __init__(self, module, adapters):
+        self.module = module
+        self.adapters = adapters
+        self.original_forward = None
+        self.setup_hooks = [
+            comfy.weight_adapter.BypassForwardHook(module, adapter, multiplier=1.0)
+            for adapter in adapters
+        ]
+
+    def _forward(self, x, *args, **kwargs):
+        out = self.original_forward(x, *args, **kwargs)
+        for adapter in self.adapters:
+            out = adapter.g(out + adapter.h(x, out))
+        return out
+
+    def inject(self):
+        if self.original_forward is not None:
+            return
+
+        device = comfy.model_management.get_torch_device()
+        dtype = None
+        if hasattr(self.module, "weight") and self.module.weight is not None:
+            dtype = self.module.weight.dtype
+        if dtype is not None and dtype not in (torch.float32, torch.float16, torch.bfloat16):
+            dtype = None
+
+        for setup_hook in self.setup_hooks:
+            setup_hook._move_adapter_weights_to_device(device, dtype)
+
+        self.original_forward = self.module.forward
+        self.module.forward = self._forward
+
+    def eject(self):
+        if self.original_forward is None:
+            return
+        self.module.forward = self.original_forward
+        self.original_forward = None
 
 
 class FloatIncrementPerLatent:
@@ -164,13 +210,39 @@ class PerSampleLoraLoader:
         model.set_model_unet_function_wrapper(wrapper)
 
     @staticmethod
-    def _next_injection_key(model) -> str:
-        index = len(model.injections)
-        while True:
-            key = f"per_sample_lora_{index}"
-            if key not in model.injections:
-                return key
-            index += 1
+    def _get_module_by_key(model, key: str):
+        module_key = key[:-7] if key.endswith(".weight") else key
+        module = model
+        for part in module_key.split("."):
+            module = module[int(part)] if part.isdigit() else getattr(module, part)
+        return module
+
+    @classmethod
+    def _set_aggregate_injection(cls, model):
+        entries = model.model_options.get(AGGREGATE_ENTRIES_KEY, [])
+        grouped = {}
+        for entry in entries:
+            grouped.setdefault(entry["key"], []).append(entry["adapter"])
+
+        hooks = []
+        for key, adapters in grouped.items():
+            try:
+                module = cls._get_module_by_key(model.model, key)
+            except (AttributeError, IndexError, KeyError):
+                continue
+            if hasattr(module, "weight"):
+                hooks.append(AggregateBypassForwardHook(module, adapters))
+
+        def inject_all(model_patcher):
+            for hook in hooks:
+                hook.inject()
+
+        def eject_all(model_patcher):
+            for hook in hooks:
+                hook.eject()
+
+        model.set_injections(AGGREGATE_INJECTION_KEY, [PatcherInjection(inject=inject_all, eject=eject_all)])
+        return len(hooks)
 
     @staticmethod
     def _expand_to_actual_batch(weights: torch.Tensor, actual_batch: int) -> torch.Tensor:
@@ -277,8 +349,8 @@ class PerSampleLoraLoader:
         new_model.add_patches(loaded, base_strength)
 
         matched_bypass = 0
+        aggregate_entries = new_model.model_options.get(AGGREGATE_ENTRIES_KEY, [])
         if bypass_patches:
-            model_manager = comfy.weight_adapter.BypassInjectionManager()
             model_sd_keys = set(new_model.model.state_dict().keys())
             for key, adapter in bypass_patches.items():
                 if key in model_sd_keys:
@@ -289,11 +361,11 @@ class PerSampleLoraLoader:
                         dynamic_range,
                         base_strength,
                     )
-                    model_manager.add_adapter(key, adapter, strength=1.0)
+                    aggregate_entries.append({"key": key, "adapter": adapter})
                     matched_bypass += 1
-            model_injections = model_manager.create_injections(new_model.model)
-            if model_manager.get_hook_count() > 0:
-                new_model.set_injections(self._next_injection_key(new_model), model_injections)
+
+        new_model.model_options[AGGREGATE_ENTRIES_KEY] = aggregate_entries
+        aggregate_hooks = self._set_aggregate_injection(new_model)
 
         if matched_bypass == 0:
             raise ValueError(
@@ -305,7 +377,7 @@ class PerSampleLoraLoader:
             used = (
                 f"weights=runtime_linspace(start={start:.6g}, stop={stop:.6g}, batch=EmptySD3LatentImage) "
                 f"base={base_strength:.6g} loaded_total={len(loaded)} bypass={len(bypass_patches)} "
-                f"regular={len(regular_patches)} matched_bypass={matched_bypass}"
+                f"regular={len(regular_patches)} matched_bypass={matched_bypass} aggregate_hooks={aggregate_hooks}"
             )
         else:
             used_weights = ", ".join([f"{v:.6g}" for v in weights])
@@ -313,7 +385,7 @@ class PerSampleLoraLoader:
             used = (
                 f"weights=[{used_weights}] deltas=[{used_deltas}] base={base_strength:.6g} "
                 f"loaded_total={len(loaded)} bypass={len(bypass_patches)} regular={len(regular_patches)} "
-                f"matched_bypass={matched_bypass}"
+                f"matched_bypass={matched_bypass} aggregate_hooks={aggregate_hooks}"
             )
         return (new_model, used)
 
