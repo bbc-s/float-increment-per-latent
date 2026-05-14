@@ -123,24 +123,31 @@ class AggregateBypassForwardHook:
         self.fused_alpha_scales = alpha_scales
 
     def _can_fuse_lora(self):
+        return self._fuse_blocker_reason() is None
+
+    def _fuse_blocker_reason(self):
         if not self.adapters or not all(isinstance(adapter, LoRAAdapter) for adapter in self.adapters):
-            return False
+            return "non_lora_adapter"
         is_conv = getattr(self.adapters[0], "is_conv", False)
         conv_dim = getattr(self.adapters[0], "conv_dim", 0)
         kw_dict = getattr(self.adapters[0], "kw_dict", {})
+        ref_up_out = self.adapters[0].weights[0].shape[0]
+        ref_down_in = self.adapters[0].weights[1].shape[1:]
         for adapter in self.adapters:
             _up, _down, _alpha, mid, _dora_scale, _reshape = adapter.weights
+            if _up.shape[0] != ref_up_out or _down.shape[1:] != ref_down_in:
+                return "shape_mismatch"
             # Bypass LoRA h() ignores dora_scale and reshape metadata. The fused
             # path mirrors that bypass behavior and only rejects LoCon mid weights.
             if mid is not None:
-                return False
+                return "mid_weights"
             if getattr(adapter, "is_conv", False) != is_conv:
-                return False
+                return "conv_type_mismatch"
             if getattr(adapter, "conv_dim", 0) != conv_dim:
-                return False
+                return "conv_dim_mismatch"
             if getattr(adapter, "kw_dict", {}) != kw_dict:
-                return False
-        return True
+                return "kw_dict_mismatch"
+        return None
 
     def inject(self):
         if self.original_forward is not None:
@@ -343,6 +350,7 @@ class PerSampleLoraLoader:
         hooks = []
         fused_possible = 0
         fallback_hooks = 0
+        fallback_reasons = {}
         for key, adapters in grouped.items():
             try:
                 module = cls._get_module_by_key(model.model, key)
@@ -354,6 +362,8 @@ class PerSampleLoraLoader:
                     fused_possible += 1
                 else:
                     fallback_hooks += 1
+                    reason = hook._fuse_blocker_reason()
+                    fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
                 hooks.append(hook)
 
         def inject_all(model_patcher):
@@ -370,6 +380,7 @@ class PerSampleLoraLoader:
             "entries": len(entries),
             "fused_possible": fused_possible,
             "fallback_hooks": fallback_hooks,
+            "fallback_reasons": fallback_reasons,
         }
 
     @staticmethod
@@ -498,6 +509,9 @@ class PerSampleLoraLoader:
 
         new_model.model_options[AGGREGATE_ENTRIES_KEY] = aggregate_entries
         aggregate_stats = self._set_aggregate_injection(new_model)
+        fallback_reasons = ",".join(
+            f"{key}:{value}" for key, value in sorted(aggregate_stats["fallback_reasons"].items())
+        ) or "none"
 
         if matched_bypass == 0:
             raise ValueError(
@@ -511,7 +525,8 @@ class PerSampleLoraLoader:
                 f"base={base_strength:.6g} loaded_total={len(loaded)} bypass={len(bypass_patches)} "
                 f"regular={len(regular_patches)} matched_bypass={matched_bypass} "
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
-                f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']}"
+                f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
+                f"fallback_reasons={fallback_reasons}"
             )
         else:
             used_weights = ", ".join([f"{v:.6g}" for v in weights])
@@ -521,7 +536,8 @@ class PerSampleLoraLoader:
                 f"loaded_total={len(loaded)} bypass={len(bypass_patches)} regular={len(regular_patches)} "
                 f"matched_bypass={matched_bypass} "
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
-                f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']}"
+                f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
+                f"fallback_reasons={fallback_reasons}"
             )
         return (new_model, used)
 
