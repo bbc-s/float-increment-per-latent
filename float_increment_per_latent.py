@@ -439,6 +439,10 @@ class PerSampleLoraLoader:
                 "step": ("FLOAT", {"default": 0.1, "min": 0.000001, "max": 100.0, "step": 0.01}),
                 "direction": (["increment", "decrement"], {"default": "increment"}),
                 "manual_values": ("STRING", {"default": "0.1,0.2,0.3,0.4", "multiline": True}),
+                "dynamic_adapter_policy": (
+                    ["lora_only_fast", "exact_all_adapters"],
+                    {"default": "lora_only_fast"},
+                ),
                 "fallback_adapter_policy": (
                     ["error_on_slow_fallback", "static_base_only", "allow_slow_fallback"],
                     {"default": "error_on_slow_fallback"},
@@ -627,6 +631,7 @@ class PerSampleLoraLoader:
         step,
         direction,
         manual_values,
+        dynamic_adapter_policy,
         fallback_adapter_policy,
     ):
         if mode == "manual_values":
@@ -681,9 +686,8 @@ class PerSampleLoraLoader:
             for key, adapter in bypass_patches.items():
                 if key in model_sd_keys:
                     if (
-                        fallback_adapter_policy == "static_base_only"
+                        (dynamic_adapter_policy == "lora_only_fast" or fallback_adapter_policy == "static_base_only")
                         and not AggregateBypassForwardHook._is_lora_like(adapter)
-                        and not AggregateBypassForwardHook._is_lokr_direct_like(adapter)
                     ):
                         skipped_static_adapters += 1
                         continue
@@ -727,7 +731,7 @@ class PerSampleLoraLoader:
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
                 f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
                 f"fallback_reasons={fallback_reasons} fallback_types={fallback_types} "
-                f"skipped_static_adapters={skipped_static_adapters}"
+                f"dynamic_adapter_policy={dynamic_adapter_policy} skipped_static_adapters={skipped_static_adapters}"
             )
         else:
             used_weights = ", ".join([f"{v:.6g}" for v in weights])
@@ -739,7 +743,7 @@ class PerSampleLoraLoader:
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
                 f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
                 f"fallback_reasons={fallback_reasons} fallback_types={fallback_types} "
-                f"skipped_static_adapters={skipped_static_adapters}"
+                f"dynamic_adapter_policy={dynamic_adapter_policy} skipped_static_adapters={skipped_static_adapters}"
             )
         return (new_model, used)
 
