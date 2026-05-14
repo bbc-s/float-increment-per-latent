@@ -339,13 +339,20 @@ class PerSampleLoraLoader:
             grouped.setdefault(entry["key"], []).append(entry["adapter"])
 
         hooks = []
+        fused_possible = 0
+        fallback_hooks = 0
         for key, adapters in grouped.items():
             try:
                 module = cls._get_module_by_key(model.model, key)
             except (AttributeError, IndexError, KeyError):
                 continue
             if hasattr(module, "weight"):
-                hooks.append(AggregateBypassForwardHook(module, adapters))
+                hook = AggregateBypassForwardHook(module, adapters)
+                if hook._can_fuse_lora():
+                    fused_possible += 1
+                else:
+                    fallback_hooks += 1
+                hooks.append(hook)
 
         def inject_all(model_patcher):
             for hook in hooks:
@@ -356,7 +363,12 @@ class PerSampleLoraLoader:
                 hook.eject()
 
         model.set_injections(AGGREGATE_INJECTION_KEY, [PatcherInjection(inject=inject_all, eject=eject_all)])
-        return len(hooks)
+        return {
+            "hooks": len(hooks),
+            "entries": len(entries),
+            "fused_possible": fused_possible,
+            "fallback_hooks": fallback_hooks,
+        }
 
     @staticmethod
     def _expand_to_actual_batch(weights: torch.Tensor, actual_batch: int) -> torch.Tensor:
@@ -483,7 +495,7 @@ class PerSampleLoraLoader:
                     matched_bypass += 1
 
         new_model.model_options[AGGREGATE_ENTRIES_KEY] = aggregate_entries
-        aggregate_hooks = self._set_aggregate_injection(new_model)
+        aggregate_stats = self._set_aggregate_injection(new_model)
 
         if matched_bypass == 0:
             raise ValueError(
@@ -495,7 +507,9 @@ class PerSampleLoraLoader:
             used = (
                 f"weights=runtime_linspace(start={start:.6g}, stop={stop:.6g}, batch=EmptySD3LatentImage) "
                 f"base={base_strength:.6g} loaded_total={len(loaded)} bypass={len(bypass_patches)} "
-                f"regular={len(regular_patches)} matched_bypass={matched_bypass} aggregate_hooks={aggregate_hooks}"
+                f"regular={len(regular_patches)} matched_bypass={matched_bypass} "
+                f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
+                f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']}"
             )
         else:
             used_weights = ", ".join([f"{v:.6g}" for v in weights])
@@ -503,7 +517,9 @@ class PerSampleLoraLoader:
             used = (
                 f"weights=[{used_weights}] deltas=[{used_deltas}] base={base_strength:.6g} "
                 f"loaded_total={len(loaded)} bypass={len(bypass_patches)} regular={len(regular_patches)} "
-                f"matched_bypass={matched_bypass} aggregate_hooks={aggregate_hooks}"
+                f"matched_bypass={matched_bypass} "
+                f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
+                f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']}"
             )
         return (new_model, used)
 
