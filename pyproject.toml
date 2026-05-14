@@ -1,0 +1,14 @@
+[project]
+name = "float-increment-per-latent"
+description = "ComfyUI custom node for sweeping LoRA model strength per latent sample in a single batch."
+version = "0.1.0"
+license = { text = "MIT" }
+dependencies = []
+
+[project.urls]
+Repository = "https://github.com/bbc-s/float-increment-per-latent"
+
+[tool.comfy]
+PublisherId = "bbc-s"
+DisplayName = "Float Increment Per Latent"
+Icon = ""
