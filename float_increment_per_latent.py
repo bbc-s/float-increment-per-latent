@@ -129,8 +129,10 @@ class AggregateBypassForwardHook:
         conv_dim = getattr(self.adapters[0], "conv_dim", 0)
         kw_dict = getattr(self.adapters[0], "kw_dict", {})
         for adapter in self.adapters:
-            _up, _down, _alpha, mid, dora_scale, reshape = adapter.weights
-            if mid is not None or dora_scale is not None or reshape is not None:
+            _up, _down, _alpha, mid, _dora_scale, _reshape = adapter.weights
+            # Bypass LoRA h() ignores dora_scale and reshape metadata. The fused
+            # path mirrors that bypass behavior and only rejects LoCon mid weights.
+            if mid is not None:
                 return False
             if getattr(adapter, "is_conv", False) != is_conv:
                 return False
