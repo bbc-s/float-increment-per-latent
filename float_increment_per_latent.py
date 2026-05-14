@@ -16,6 +16,9 @@ import folder_paths
 
 AGGREGATE_INJECTION_KEY = "per_sample_lora_aggregate"
 AGGREGATE_ENTRIES_KEY = "_per_sample_lora_entries"
+RUNTIME_STATES_KEY = "_per_sample_lora_runtime_states"
+RUNTIME_WRAPPER_INSTALLED_KEY = "_per_sample_lora_runtime_wrapper_installed"
+LOKR_FUSE_CHUNK_SIZE = 1
 
 
 class AggregateBypassForwardHook:
@@ -89,32 +92,48 @@ class AggregateBypassForwardHook:
 
     def _fused_lokr_delta(self, x, out, group):
         adapters = group["adapters"]
-        scales = torch.stack([
-            self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype)
-            for adapter in adapters
-        ], dim=1)
 
         if group["is_conv"]:
             conv_fn = (F.conv1d, F.conv2d, F.conv3d)[group["conv_dim"] - 1]
             b, _c, *spatial = x.shape
             uq = group["uq"]
             h_in_group = x.reshape(b * uq, -1, *spatial)
-            hb = conv_fn(h_in_group, group["w2"].to(dtype=x.dtype), **group["kw_dict"])
             out_k = group["out_k"]
-            spatial_out = hb.shape[2:]
-            hb = hb.view(b, uq, len(adapters), out_k, *spatial_out)
-            hc = torch.einsum("bqnk...,nlq->bnlk...", hb, group["w1"].to(dtype=x.dtype))
-            hc = hc * scales.view(b, len(adapters), 1, 1, *([1] * len(spatial_out)))
-            return hc.sum(dim=1).reshape(b, -1, *spatial_out)
+            result = None
+            for start in range(0, len(adapters), group["chunk_size"]):
+                end = min(start + group["chunk_size"], len(adapters))
+                chunk_adapters = adapters[start:end]
+                scales = torch.stack([
+                    self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype)
+                    for adapter in chunk_adapters
+                ], dim=1)
+                hb = conv_fn(h_in_group, group["w2"][start * out_k:end * out_k].to(dtype=x.dtype), **group["kw_dict"])
+                spatial_out = hb.shape[2:]
+                hb = hb.view(b, uq, len(chunk_adapters), out_k, *spatial_out)
+                hc = torch.einsum("bqnk...,nlq->bnlk...", hb, group["w1"][start:end].to(dtype=x.dtype))
+                hc = hc * scales.view(b, len(chunk_adapters), 1, 1, *([1] * len(spatial_out)))
+                chunk_out = hc.sum(dim=1).reshape(b, -1, *spatial_out)
+                result = chunk_out if result is None else result + chunk_out
+            return result
 
         uq = group["uq"]
         h_in_group = x.reshape(*x.shape[:-1], uq, -1)
-        hb = F.linear(h_in_group, group["w2"].to(dtype=x.dtype))
         out_k = group["out_k"]
-        hb = hb.view(*h_in_group.shape[:-1], len(adapters), out_k)
-        hc = torch.einsum("...qnk,nlq->...nlk", hb, group["w1"].to(dtype=x.dtype))
-        hc = hc * scales.view(*([x.shape[0]] + [1] * (hc.ndim - 4) + [len(adapters), 1, 1]))
-        return hc.sum(dim=-3).reshape(*x.shape[:-1], -1)
+        result = None
+        for start in range(0, len(adapters), group["chunk_size"]):
+            end = min(start + group["chunk_size"], len(adapters))
+            chunk_adapters = adapters[start:end]
+            scales = torch.stack([
+                self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype)
+                for adapter in chunk_adapters
+            ], dim=1)
+            hb = F.linear(h_in_group, group["w2"][start * out_k:end * out_k].to(dtype=x.dtype))
+            hb = hb.view(*h_in_group.shape[:-1], len(chunk_adapters), out_k)
+            hc = torch.einsum("...qnk,nlq->...nlk", hb, group["w1"][start:end].to(dtype=x.dtype))
+            hc = hc * scales.view(*([x.shape[0]] + [1] * (hc.ndim - 4) + [len(chunk_adapters), 1, 1]))
+            chunk_out = hc.sum(dim=-3).reshape(*x.shape[:-1], -1)
+            result = chunk_out if result is None else result + chunk_out
+        return result
 
     def _prepare_fused_lora(self, dtype):
         self.fused_is_conv = getattr(self.fused_adapters[0], "is_conv", False)
@@ -196,6 +215,7 @@ class AggregateBypassForwardHook:
                 "is_conv": is_conv,
                 "conv_dim": conv_dim,
                 "kw_dict": getattr(first, "kw_dict", {}) if is_conv else {},
+                "chunk_size": LOKR_FUSE_CHUNK_SIZE,
             })
 
     def _can_fuse_lora(self):
@@ -466,16 +486,25 @@ class PerSampleLoraLoader:
 
     @staticmethod
     def _install_runtime_batch_tracker(model, runtime_state):
+        states = model.model_options.get(RUNTIME_STATES_KEY, [])
+        states.append(runtime_state)
+        model.model_options[RUNTIME_STATES_KEY] = states
+        if model.model_options.get(RUNTIME_WRAPPER_INSTALLED_KEY, False):
+            return
+
         previous_wrapper = model.model_options.get("model_function_wrapper")
 
         def wrapper(model_apply, args):
             cond_chunks = len(args.get("cond_or_uncond", [])) or 1
-            runtime_state["batch_size"] = max(1, int(args["input"].shape[0]) // cond_chunks)
+            batch_size = max(1, int(args["input"].shape[0]) // cond_chunks)
+            for state in model.model_options.get(RUNTIME_STATES_KEY, []):
+                state["batch_size"] = batch_size
             if previous_wrapper is not None:
                 return previous_wrapper(model_apply, args)
             return model_apply(args["input"], args["timestep"], **args["c"])
 
         model.set_model_unet_function_wrapper(wrapper)
+        model.model_options[RUNTIME_WRAPPER_INSTALLED_KEY] = True
 
     @staticmethod
     def _get_module_by_key(model, key: str):
