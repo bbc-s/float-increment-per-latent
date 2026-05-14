@@ -27,7 +27,8 @@ class AggregateBypassForwardHook:
             comfy.weight_adapter.BypassForwardHook(module, adapter, multiplier=1.0)
             for adapter in adapters
         ]
-        self.can_fuse_lora = False
+        self.fused_adapters = []
+        self.fallback_adapters = adapters[:]
         self.fused_down = None
         self.fused_up = None
         self.fused_ranks = None
@@ -38,9 +39,9 @@ class AggregateBypassForwardHook:
 
     def _forward(self, x, *args, **kwargs):
         out = self.original_forward(x, *args, **kwargs)
-        if self.can_fuse_lora:
-            return out + self._fused_lora_delta(x, out)
-        for adapter in self.adapters:
+        if self.fused_adapters:
+            out = out + self._fused_lora_delta(x, out)
+        for adapter in self.fallback_adapters:
             out = adapter.g(out + adapter.h(x, out))
         return out
 
@@ -66,7 +67,7 @@ class AggregateBypassForwardHook:
     def _fused_lora_delta(self, x, out):
         rank_scales = []
 
-        for adapter, rank, alpha_scale in zip(self.adapters, self.fused_ranks, self.fused_alpha_scales):
+        for adapter, rank, alpha_scale in zip(self.fused_adapters, self.fused_ranks, self.fused_alpha_scales):
             sample_scale = self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype) * alpha_scale
             rank_scales.append(sample_scale[:, None].expand(-1, rank))
 
@@ -83,16 +84,16 @@ class AggregateBypassForwardHook:
         return F.linear(hidden, self.fused_up.to(dtype=x.dtype))
 
     def _prepare_fused_lora(self, dtype):
-        self.fused_is_conv = getattr(self.adapters[0], "is_conv", False)
-        self.fused_conv_dim = getattr(self.adapters[0], "conv_dim", 0)
-        self.fused_kw_dict = getattr(self.adapters[0], "kw_dict", {})
+        self.fused_is_conv = getattr(self.fused_adapters[0], "is_conv", False)
+        self.fused_conv_dim = getattr(self.fused_adapters[0], "conv_dim", 0)
+        self.fused_kw_dict = getattr(self.fused_adapters[0], "kw_dict", {})
 
         down_weights = []
         up_weights = []
         ranks = []
         alpha_scales = []
 
-        for adapter in self.adapters:
+        for adapter in self.fused_adapters:
             up, down, alpha, _mid, _dora_scale, _reshape = adapter.weights
             if dtype is not None:
                 up = up.to(dtype=dtype)
@@ -122,7 +123,8 @@ class AggregateBypassForwardHook:
         self.fused_alpha_scales = alpha_scales
 
     def _can_fuse_lora(self):
-        return self._fuse_blocker_reason() is None
+        fused, _fallback, _reasons = self._partition_adapters_for_fusion()
+        return len(fused) > 0
 
     @staticmethod
     def _is_lora_like(adapter):
@@ -147,29 +149,41 @@ class AggregateBypassForwardHook:
             shapes.append("x".join(str(dim) for dim in item.shape) if isinstance(item, torch.Tensor) else type(item).__name__)
         return f"{type(adapter).__name__}:len={len(weights)}:w0={shapes[0]}:w1={shapes[1]}"
 
-    def _fuse_blocker_reason(self):
-        if not self.adapters or not all(self._is_lora_like(adapter) for adapter in self.adapters):
+    def _adapter_fuse_blocker_reason(self, adapter, ref_adapter):
+        if not self._is_lora_like(adapter):
             return "non_lora_adapter"
-        is_conv = getattr(self.adapters[0], "is_conv", False)
-        conv_dim = getattr(self.adapters[0], "conv_dim", 0)
-        kw_dict = getattr(self.adapters[0], "kw_dict", {})
-        ref_up_out = self.adapters[0].weights[0].shape[0]
-        ref_down_in = self.adapters[0].weights[1].shape[1:]
-        for adapter in self.adapters:
-            _up, _down, _alpha, mid, _dora_scale, _reshape = adapter.weights
-            if _up.shape[0] != ref_up_out or _down.shape[1:] != ref_down_in:
-                return "shape_mismatch"
-            # Bypass LoRA h() ignores dora_scale and reshape metadata. The fused
-            # path mirrors that bypass behavior and only rejects LoCon mid weights.
-            if mid is not None:
-                return "mid_weights"
-            if getattr(adapter, "is_conv", False) != is_conv:
-                return "conv_type_mismatch"
-            if getattr(adapter, "conv_dim", 0) != conv_dim:
-                return "conv_dim_mismatch"
-            if getattr(adapter, "kw_dict", {}) != kw_dict:
-                return "kw_dict_mismatch"
+        _up, _down, _alpha, mid, _dora_scale, _reshape = adapter.weights
+        ref_up, ref_down = ref_adapter.weights[0], ref_adapter.weights[1]
+        if _up.shape[0] != ref_up.shape[0] or _down.shape[1:] != ref_down.shape[1:]:
+            return "shape_mismatch"
+        # Bypass LoRA h() ignores dora_scale and reshape metadata. The fused
+        # path mirrors that bypass behavior and only rejects LoCon mid weights.
+        if mid is not None:
+            return "mid_weights"
+        if getattr(adapter, "is_conv", False) != getattr(ref_adapter, "is_conv", False):
+            return "conv_type_mismatch"
+        if getattr(adapter, "conv_dim", 0) != getattr(ref_adapter, "conv_dim", 0):
+            return "conv_dim_mismatch"
+        if getattr(adapter, "kw_dict", {}) != getattr(ref_adapter, "kw_dict", {}):
+            return "kw_dict_mismatch"
         return None
+
+    def _partition_adapters_for_fusion(self):
+        ref_adapter = next((adapter for adapter in self.adapters if self._is_lora_like(adapter)), None)
+        if ref_adapter is None:
+            return [], self.adapters[:], {"non_lora_adapter": len(self.adapters)}
+
+        fused = []
+        fallback = []
+        reasons = {}
+        for adapter in self.adapters:
+            reason = self._adapter_fuse_blocker_reason(adapter, ref_adapter)
+            if reason is None:
+                fused.append(adapter)
+            else:
+                fallback.append(adapter)
+                reasons[reason] = reasons.get(reason, 0) + 1
+        return fused, fallback, reasons
 
     def inject(self):
         if self.original_forward is not None:
@@ -185,8 +199,8 @@ class AggregateBypassForwardHook:
         for setup_hook in self.setup_hooks:
             setup_hook._move_adapter_weights_to_device(device, dtype)
 
-        self.can_fuse_lora = self._can_fuse_lora()
-        if self.can_fuse_lora:
+        self.fused_adapters, self.fallback_adapters, _reasons = self._partition_adapters_for_fusion()
+        if self.fused_adapters:
             self._prepare_fused_lora(dtype)
         self.original_forward = self.module.forward
         self.module.forward = self._forward
@@ -200,6 +214,8 @@ class AggregateBypassForwardHook:
         self.fused_up = None
         self.fused_ranks = None
         self.fused_alpha_scales = None
+        self.fused_adapters = []
+        self.fallback_adapters = self.adapters[:]
 
 
 class FloatIncrementPerLatent:
@@ -381,15 +397,17 @@ class PerSampleLoraLoader:
                 continue
             if hasattr(module, "weight"):
                 hook = AggregateBypassForwardHook(module, adapters)
-                if hook._can_fuse_lora():
+                fused, fallback, reasons = hook._partition_adapters_for_fusion()
+                if fused:
                     fused_possible += 1
-                else:
+                if fallback:
                     fallback_hooks += 1
-                    reason = hook._fuse_blocker_reason()
-                    fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
-                    if reason == "non_lora_adapter":
-                        type_name = hook._adapter_debug_name(adapters[0])
-                        fallback_types[type_name] = fallback_types.get(type_name, 0) + 1
+                    for reason, count in reasons.items():
+                        fallback_reasons[reason] = fallback_reasons.get(reason, 0) + count
+                    for adapter in fallback:
+                        if not hook._is_lora_like(adapter):
+                            type_name = hook._adapter_debug_name(adapter)
+                            fallback_types[type_name] = fallback_types.get(type_name, 0) + 1
                 hooks.append(hook)
 
         def inject_all(model_patcher):
