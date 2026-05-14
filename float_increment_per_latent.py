@@ -126,10 +126,21 @@ class AggregateBypassForwardHook:
 
     @staticmethod
     def _is_lora_like(adapter):
-        if type(adapter).__name__ != "LoRAAdapter":
-            return False
         weights = getattr(adapter, "weights", None)
-        return isinstance(weights, tuple) and len(weights) == 6
+        if not isinstance(weights, tuple) or len(weights) != 6:
+            return False
+        up, down, _alpha, _mid, _dora_scale, _reshape = weights
+        return isinstance(up, torch.Tensor) and isinstance(down, torch.Tensor)
+
+    @staticmethod
+    def _adapter_debug_name(adapter):
+        weights = getattr(adapter, "weights", None)
+        if not isinstance(weights, tuple):
+            return f"{type(adapter).__name__}:weights={type(weights).__name__}"
+        shapes = []
+        for item in weights[:2]:
+            shapes.append("x".join(str(dim) for dim in item.shape) if isinstance(item, torch.Tensor) else type(item).__name__)
+        return f"{type(adapter).__name__}:len={len(weights)}:w0={shapes[0]}:w1={shapes[1]}"
 
     def _fuse_blocker_reason(self):
         if not self.adapters or not all(self._is_lora_like(adapter) for adapter in self.adapters):
@@ -357,6 +368,7 @@ class PerSampleLoraLoader:
         fused_possible = 0
         fallback_hooks = 0
         fallback_reasons = {}
+        fallback_types = {}
         for key, adapters in grouped.items():
             try:
                 module = cls._get_module_by_key(model.model, key)
@@ -370,6 +382,9 @@ class PerSampleLoraLoader:
                     fallback_hooks += 1
                     reason = hook._fuse_blocker_reason()
                     fallback_reasons[reason] = fallback_reasons.get(reason, 0) + 1
+                    if reason == "non_lora_adapter":
+                        type_name = hook._adapter_debug_name(adapters[0])
+                        fallback_types[type_name] = fallback_types.get(type_name, 0) + 1
                 hooks.append(hook)
 
         def inject_all(model_patcher):
@@ -387,6 +402,7 @@ class PerSampleLoraLoader:
             "fused_possible": fused_possible,
             "fallback_hooks": fallback_hooks,
             "fallback_reasons": fallback_reasons,
+            "fallback_types": fallback_types,
         }
 
     @staticmethod
@@ -518,6 +534,9 @@ class PerSampleLoraLoader:
         fallback_reasons = ",".join(
             f"{key}:{value}" for key, value in sorted(aggregate_stats["fallback_reasons"].items())
         ) or "none"
+        fallback_types = ";".join(
+            f"{key}:{value}" for key, value in sorted(aggregate_stats["fallback_types"].items())
+        ) or "none"
 
         if matched_bypass == 0:
             raise ValueError(
@@ -532,7 +551,7 @@ class PerSampleLoraLoader:
                 f"regular={len(regular_patches)} matched_bypass={matched_bypass} "
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
                 f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
-                f"fallback_reasons={fallback_reasons}"
+                f"fallback_reasons={fallback_reasons} fallback_types={fallback_types}"
             )
         else:
             used_weights = ", ".join([f"{v:.6g}" for v in weights])
@@ -543,7 +562,7 @@ class PerSampleLoraLoader:
                 f"matched_bypass={matched_bypass} "
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
                 f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
-                f"fallback_reasons={fallback_reasons}"
+                f"fallback_reasons={fallback_reasons} fallback_types={fallback_types}"
             )
         return (new_model, used)
 
