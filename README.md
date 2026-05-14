@@ -25,7 +25,7 @@ Outputs:
 - `model` (patched)
 - `weights_used` (string preview)
 
-Multiple `Per Sample LoRA Loader (Single Pass)` nodes can be stacked. Stacked LoRAs are aggregated into shared per-layer bypass hooks, so different LoRAs and ranges can be applied in sequence without creating one wrapper chain per node.
+Multiple `Per Sample LoRA Loader (Single Pass)` nodes can be stacked. Stacked LoRAs are aggregated into shared per-layer bypass hooks, and standard LoRA adapters are fused per layer into one larger rank projection where possible.
 
 ## Wiring
 1. `CheckpointLoaderSimple.model` -> `Per Sample LoRA Loader (Single Pass).model`

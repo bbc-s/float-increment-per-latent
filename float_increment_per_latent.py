@@ -2,6 +2,7 @@
 from typing import List
 
 import torch
+import torch.nn.functional as F
 
 import comfy.lora
 import comfy.lora_convert
@@ -10,6 +11,7 @@ import comfy.sd
 import comfy.utils
 import comfy.weight_adapter
 from comfy.patcher_extension import PatcherInjection
+from comfy.weight_adapter.lora import LoRAAdapter
 import folder_paths
 
 
@@ -26,12 +28,97 @@ class AggregateBypassForwardHook:
             comfy.weight_adapter.BypassForwardHook(module, adapter, multiplier=1.0)
             for adapter in adapters
         ]
+        self.can_fuse_lora = False
 
     def _forward(self, x, *args, **kwargs):
         out = self.original_forward(x, *args, **kwargs)
+        if self.can_fuse_lora:
+            return out + self._fused_lora_delta(x, out)
         for adapter in self.adapters:
             out = adapter.g(out + adapter.h(x, out))
         return out
+
+    def _adapter_multiplier(self, adapter, x, out):
+        weights_cpu = getattr(adapter, "_pslora_weights_cpu", None)
+        dynamic_range = getattr(adapter, "_pslora_dynamic_range", None)
+        base_strength = getattr(adapter, "_pslora_base_strength", 0.0)
+        actual_batch = int(x.shape[0])
+
+        if dynamic_range is not None:
+            runtime_state = getattr(adapter, "_pslora_runtime_state", {})
+            logical_batch = int(runtime_state.get("batch_size", actual_batch))
+            start, stop = dynamic_range
+            weights = PerSampleLoraLoader._build_range_step_by_batch_tensor(
+                start, stop, logical_batch, x.device, out.dtype
+            )
+            deltas = weights - base_strength
+            return PerSampleLoraLoader._expand_to_actual_batch(deltas, actual_batch)
+
+        weights = weights_cpu.to(device=x.device, dtype=out.dtype)
+        return PerSampleLoraLoader._expand_to_actual_batch(weights, actual_batch)
+
+    def _fused_lora_delta(self, x, out):
+        is_conv = getattr(self.adapters[0], "is_conv", False)
+        conv_dim = getattr(self.adapters[0], "conv_dim", 0)
+        kw_dict = getattr(self.adapters[0], "kw_dict", {})
+
+        down_weights = []
+        up_weights = []
+        rank_scales = []
+
+        for adapter in self.adapters:
+            up, down, alpha, _mid, _dora_scale, _reshape = adapter.weights
+            up = up.to(device=x.device, dtype=x.dtype)
+            down = down.to(device=x.device, dtype=x.dtype)
+
+            rank = int(down.shape[0])
+            alpha_scale = (float(alpha) / rank) if alpha is not None else 1.0
+            sample_scale = self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype) * alpha_scale
+            rank_scales.append(sample_scale[:, None].repeat(1, rank))
+
+            if is_conv:
+                kernel_size = getattr(adapter, "kernel_size", (1,) * conv_dim)
+                in_channels = getattr(adapter, "in_channels", None)
+                if down.dim() == 2:
+                    if in_channels is not None:
+                        down = down.view(down.shape[0], in_channels, *kernel_size)
+                    else:
+                        down = down.view(*down.shape, *([1] * conv_dim))
+                if up.dim() == 2:
+                    up = up.view(*up.shape, *([1] * conv_dim))
+
+            down_weights.append(down)
+            up_weights.append(up)
+
+        if is_conv:
+            conv_fn = (F.conv1d, F.conv2d, F.conv3d)[conv_dim - 1]
+            hidden = conv_fn(x, torch.cat(down_weights, dim=0), **kw_dict)
+            scale = torch.cat(rank_scales, dim=1).view(x.shape[0], -1, *([1] * conv_dim))
+            hidden = hidden * scale
+            return conv_fn(hidden, torch.cat(up_weights, dim=1))
+
+        hidden = F.linear(x, torch.cat(down_weights, dim=0))
+        scale_shape = [x.shape[0]] + [1] * (hidden.ndim - 2) + [-1]
+        hidden = hidden * torch.cat(rank_scales, dim=1).view(*scale_shape)
+        return F.linear(hidden, torch.cat(up_weights, dim=1))
+
+    def _can_fuse_lora(self):
+        if not self.adapters or not all(isinstance(adapter, LoRAAdapter) for adapter in self.adapters):
+            return False
+        is_conv = getattr(self.adapters[0], "is_conv", False)
+        conv_dim = getattr(self.adapters[0], "conv_dim", 0)
+        kw_dict = getattr(self.adapters[0], "kw_dict", {})
+        for adapter in self.adapters:
+            _up, _down, _alpha, mid, dora_scale, reshape = adapter.weights
+            if mid is not None or dora_scale is not None or reshape is not None:
+                return False
+            if getattr(adapter, "is_conv", False) != is_conv:
+                return False
+            if getattr(adapter, "conv_dim", 0) != conv_dim:
+                return False
+            if getattr(adapter, "kw_dict", {}) != kw_dict:
+                return False
+        return True
 
     def inject(self):
         if self.original_forward is not None:
@@ -47,6 +134,7 @@ class AggregateBypassForwardHook:
         for setup_hook in self.setup_hooks:
             setup_hook._move_adapter_weights_to_device(device, dtype)
 
+        self.can_fuse_lora = self._can_fuse_lora()
         self.original_forward = self.module.forward
         self.module.forward = self._forward
 
@@ -268,6 +356,10 @@ class PerSampleLoraLoader:
         weights_cpu = None
         if per_sample_weights is not None:
             weights_cpu = torch.tensor(per_sample_weights, dtype=torch.float32)
+        adapter._pslora_weights_cpu = weights_cpu
+        adapter._pslora_runtime_state = runtime_state
+        adapter._pslora_dynamic_range = dynamic_range
+        adapter._pslora_base_strength = base_strength
 
         def patched_h(x, base_out):
             actual_batch = int(x.shape[0])
