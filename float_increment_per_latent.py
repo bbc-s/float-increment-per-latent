@@ -28,6 +28,7 @@ class AggregateBypassForwardHook:
             for adapter in adapters
         ]
         self.fused_adapters = []
+        self.fused_lokr_adapters = []
         self.fallback_adapters = adapters[:]
         self.fused_down = None
         self.fused_up = None
@@ -36,11 +37,14 @@ class AggregateBypassForwardHook:
         self.fused_is_conv = False
         self.fused_conv_dim = 0
         self.fused_kw_dict = {}
+        self.fused_lokr_groups = []
 
     def _forward(self, x, *args, **kwargs):
         out = self.original_forward(x, *args, **kwargs)
         if self.fused_adapters:
             out = out + self._fused_lora_delta(x, out)
+        for group in self.fused_lokr_groups:
+            out = out + self._fused_lokr_delta(x, out, group)
         for adapter in self.fallback_adapters:
             out = adapter.g(out + adapter.h(x, out))
         return out
@@ -83,6 +87,35 @@ class AggregateBypassForwardHook:
         hidden = hidden * torch.cat(rank_scales, dim=1).view(*scale_shape)
         return F.linear(hidden, self.fused_up.to(dtype=x.dtype))
 
+    def _fused_lokr_delta(self, x, out, group):
+        adapters = group["adapters"]
+        scales = torch.stack([
+            self._adapter_multiplier(adapter, x, out).to(dtype=x.dtype)
+            for adapter in adapters
+        ], dim=1)
+
+        if group["is_conv"]:
+            conv_fn = (F.conv1d, F.conv2d, F.conv3d)[group["conv_dim"] - 1]
+            b, _c, *spatial = x.shape
+            uq = group["uq"]
+            h_in_group = x.reshape(b * uq, -1, *spatial)
+            hb = conv_fn(h_in_group, group["w2"].to(dtype=x.dtype), **group["kw_dict"])
+            out_k = group["out_k"]
+            spatial_out = hb.shape[2:]
+            hb = hb.view(b, uq, len(adapters), out_k, *spatial_out)
+            hc = torch.einsum("bqnk...,nlq->bnlk...", hb, group["w1"].to(dtype=x.dtype))
+            hc = hc * scales.view(b, len(adapters), 1, 1, *([1] * len(spatial_out)))
+            return hc.sum(dim=1).reshape(b, -1, *spatial_out)
+
+        uq = group["uq"]
+        h_in_group = x.reshape(*x.shape[:-1], uq, -1)
+        hb = F.linear(h_in_group, group["w2"].to(dtype=x.dtype))
+        out_k = group["out_k"]
+        hb = hb.view(*h_in_group.shape[:-1], len(adapters), out_k)
+        hc = torch.einsum("...qnk,nlq->...nlk", hb, group["w1"].to(dtype=x.dtype))
+        hc = hc * scales.view(*([x.shape[0]] + [1] * (hc.ndim - 4) + [len(adapters), 1, 1]))
+        return hc.sum(dim=-3).reshape(*x.shape[:-1], -1)
+
     def _prepare_fused_lora(self, dtype):
         self.fused_is_conv = getattr(self.fused_adapters[0], "is_conv", False)
         self.fused_conv_dim = getattr(self.fused_adapters[0], "conv_dim", 0)
@@ -122,6 +155,49 @@ class AggregateBypassForwardHook:
         self.fused_ranks = ranks
         self.fused_alpha_scales = alpha_scales
 
+    def _prepare_fused_lokr(self, dtype):
+        groups = {}
+        for adapter in self.fused_lokr_adapters:
+            if not self._is_lokr_direct_like(adapter):
+                continue
+            w1, w2 = adapter.weights[0], adapter.weights[1]
+            key = (
+                tuple(w1.shape),
+                tuple(w2.shape),
+                getattr(adapter, "is_conv", False),
+                getattr(adapter, "conv_dim", 0),
+                tuple(sorted(getattr(adapter, "kw_dict", {}).items())),
+            )
+            groups.setdefault(key, []).append(adapter)
+
+        self.fused_lokr_groups = []
+        for adapters in groups.values():
+            first = adapters[0]
+            is_conv = getattr(first, "is_conv", False)
+            conv_dim = getattr(first, "conv_dim", 0)
+            w1_list = []
+            w2_list = []
+            for adapter in adapters:
+                w1, w2 = adapter.weights[0], adapter.weights[1]
+                if dtype is not None:
+                    w1 = w1.to(dtype=dtype)
+                    w2 = w2.to(dtype=dtype)
+                if is_conv and w2.dim() == 2:
+                    w2 = w2.view(*w2.shape, *([1] * conv_dim))
+                w1_list.append(w1)
+                w2_list.append(w2)
+
+            self.fused_lokr_groups.append({
+                "adapters": adapters,
+                "w1": torch.stack(w1_list, dim=0).contiguous(),
+                "w2": torch.cat(w2_list, dim=0).contiguous(),
+                "uq": int(w1_list[0].shape[1]),
+                "out_k": int(w2_list[0].shape[0]),
+                "is_conv": is_conv,
+                "conv_dim": conv_dim,
+                "kw_dict": getattr(first, "kw_dict", {}) if is_conv else {},
+            })
+
     def _can_fuse_lora(self):
         fused, _fallback, _reasons = self._partition_adapters_for_fusion()
         return len(fused) > 0
@@ -138,6 +214,20 @@ class AggregateBypassForwardHook:
             and hasattr(down, "shape")
             and hasattr(down, "to")
         )
+
+    @staticmethod
+    def _is_lokr_direct_like(adapter):
+        weights = getattr(adapter, "weights", None)
+        if type(adapter).__name__ != "LoKrAdapter":
+            return False
+        if not isinstance(weights, (list, tuple)) or len(weights) != 9:
+            return False
+        w1, w2 = weights[0], weights[1]
+        if w1 is None or w2 is None:
+            return False
+        if any(weights[index] is not None for index in (3, 4, 5, 6, 7)):
+            return False
+        return hasattr(w1, "shape") and hasattr(w1, "to") and hasattr(w2, "shape") and hasattr(w2, "to")
 
     @staticmethod
     def _adapter_debug_name(adapter):
@@ -171,12 +261,20 @@ class AggregateBypassForwardHook:
     def _partition_adapters_for_fusion(self):
         ref_adapter = next((adapter for adapter in self.adapters if self._is_lora_like(adapter)), None)
         if ref_adapter is None:
-            return [], self.adapters[:], {"non_lora_adapter": len(self.adapters)}
+            fused = [adapter for adapter in self.adapters if self._is_lokr_direct_like(adapter)]
+            fallback = [adapter for adapter in self.adapters if not self._is_lokr_direct_like(adapter)]
+            reasons = {}
+            if fallback:
+                reasons["non_lora_adapter"] = len(fallback)
+            return fused, fallback, reasons
 
         fused = []
         fallback = []
         reasons = {}
         for adapter in self.adapters:
+            if self._is_lokr_direct_like(adapter):
+                fused.append(adapter)
+                continue
             reason = self._adapter_fuse_blocker_reason(adapter, ref_adapter)
             if reason is None:
                 fused.append(adapter)
@@ -199,9 +297,12 @@ class AggregateBypassForwardHook:
         for setup_hook in self.setup_hooks:
             setup_hook._move_adapter_weights_to_device(device, dtype)
 
-        self.fused_adapters, self.fallback_adapters, _reasons = self._partition_adapters_for_fusion()
+        fused_adapters, self.fallback_adapters, _reasons = self._partition_adapters_for_fusion()
+        self.fused_adapters = [adapter for adapter in fused_adapters if self._is_lora_like(adapter)]
+        self.fused_lokr_adapters = [adapter for adapter in fused_adapters if self._is_lokr_direct_like(adapter)]
         if self.fused_adapters:
             self._prepare_fused_lora(dtype)
+        self._prepare_fused_lokr(dtype)
         self.original_forward = self.module.forward
         self.module.forward = self._forward
 
@@ -215,7 +316,9 @@ class AggregateBypassForwardHook:
         self.fused_ranks = None
         self.fused_alpha_scales = None
         self.fused_adapters = []
+        self.fused_lokr_adapters = []
         self.fallback_adapters = self.adapters[:]
+        self.fused_lokr_groups = []
 
 
 class FloatIncrementPerLatent:
@@ -548,7 +651,11 @@ class PerSampleLoraLoader:
             model_sd_keys = set(new_model.model.state_dict().keys())
             for key, adapter in bypass_patches.items():
                 if key in model_sd_keys:
-                    if fallback_adapter_policy == "static_base_only" and not AggregateBypassForwardHook._is_lora_like(adapter):
+                    if (
+                        fallback_adapter_policy == "static_base_only"
+                        and not AggregateBypassForwardHook._is_lora_like(adapter)
+                        and not AggregateBypassForwardHook._is_lokr_direct_like(adapter)
+                    ):
                         skipped_static_adapters += 1
                         continue
                     self._attach_per_sample_multiplier(
