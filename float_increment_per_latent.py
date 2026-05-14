@@ -316,6 +316,10 @@ class PerSampleLoraLoader:
                 "step": ("FLOAT", {"default": 0.1, "min": 0.000001, "max": 100.0, "step": 0.01}),
                 "direction": (["increment", "decrement"], {"default": "increment"}),
                 "manual_values": ("STRING", {"default": "0.1,0.2,0.3,0.4", "multiline": True}),
+                "fallback_adapter_policy": (
+                    ["error_on_slow_fallback", "static_base_only", "allow_slow_fallback"],
+                    {"default": "error_on_slow_fallback"},
+                ),
             }
         }
 
@@ -491,6 +495,7 @@ class PerSampleLoraLoader:
         step,
         direction,
         manual_values,
+        fallback_adapter_policy,
     ):
         if mode == "manual_values":
             values = self._parse_manual_values(manual_values)
@@ -537,11 +542,15 @@ class PerSampleLoraLoader:
         new_model.add_patches(loaded, base_strength)
 
         matched_bypass = 0
+        skipped_static_adapters = 0
         aggregate_entries = new_model.model_options.get(AGGREGATE_ENTRIES_KEY, [])
         if bypass_patches:
             model_sd_keys = set(new_model.model.state_dict().keys())
             for key, adapter in bypass_patches.items():
                 if key in model_sd_keys:
+                    if fallback_adapter_policy == "static_base_only" and not AggregateBypassForwardHook._is_lora_like(adapter):
+                        skipped_static_adapters += 1
+                        continue
                     self._attach_per_sample_multiplier(
                         adapter,
                         delta_weights,
@@ -566,6 +575,13 @@ class PerSampleLoraLoader:
                 "Per-sample LoRA hooks were not attached (0 matched adapter keys). "
                 "This LoRA/model pair is not compatible with this per-sample bypass method."
             )
+        if fallback_adapter_policy == "error_on_slow_fallback" and aggregate_stats["fallback_hooks"] > 0:
+            raise ValueError(
+                "Slow per-sample fallback adapters detected. "
+                f"fallback_reasons={fallback_reasons}; fallback_types={fallback_types}. "
+                "Use fallback_adapter_policy=static_base_only to keep these adapters at base strength, "
+                "or allow_slow_fallback to run the slow exact path."
+            )
 
         if dynamic_range is not None:
             used = (
@@ -574,7 +590,8 @@ class PerSampleLoraLoader:
                 f"regular={len(regular_patches)} matched_bypass={matched_bypass} "
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
                 f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
-                f"fallback_reasons={fallback_reasons} fallback_types={fallback_types}"
+                f"fallback_reasons={fallback_reasons} fallback_types={fallback_types} "
+                f"skipped_static_adapters={skipped_static_adapters}"
             )
         else:
             used_weights = ", ".join([f"{v:.6g}" for v in weights])
@@ -585,7 +602,8 @@ class PerSampleLoraLoader:
                 f"matched_bypass={matched_bypass} "
                 f"aggregate_entries={aggregate_stats['entries']} aggregate_hooks={aggregate_stats['hooks']} "
                 f"fused_hooks={aggregate_stats['fused_possible']} fallback_hooks={aggregate_stats['fallback_hooks']} "
-                f"fallback_reasons={fallback_reasons} fallback_types={fallback_types}"
+                f"fallback_reasons={fallback_reasons} fallback_types={fallback_types} "
+                f"skipped_static_adapters={skipped_static_adapters}"
             )
         return (new_model, used)
 
