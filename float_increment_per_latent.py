@@ -127,15 +127,20 @@ class AggregateBypassForwardHook:
     @staticmethod
     def _is_lora_like(adapter):
         weights = getattr(adapter, "weights", None)
-        if not isinstance(weights, tuple) or len(weights) != 6:
+        if not isinstance(weights, (list, tuple)) or len(weights) != 6:
             return False
         up, down, _alpha, _mid, _dora_scale, _reshape = weights
-        return isinstance(up, torch.Tensor) and isinstance(down, torch.Tensor)
+        return (
+            hasattr(up, "shape")
+            and hasattr(up, "to")
+            and hasattr(down, "shape")
+            and hasattr(down, "to")
+        )
 
     @staticmethod
     def _adapter_debug_name(adapter):
         weights = getattr(adapter, "weights", None)
-        if not isinstance(weights, tuple):
+        if not isinstance(weights, (list, tuple)):
             return f"{type(adapter).__name__}:weights={type(weights).__name__}"
         shapes = []
         for item in weights[:2]:
